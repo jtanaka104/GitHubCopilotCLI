@@ -146,24 +146,64 @@ function Invoke-OpenInterpreter {
     )
 
     $inputFile  = Join-Path $env:TEMP ("oi-in-" + [guid]::NewGuid().ToString() + ".txt")
+    $runnerFile = Join-Path $env:TEMP ("oi-run-" + [guid]::NewGuid().ToString() + ".ps1")
     $stdoutFile = Join-Path $env:TEMP ("oi-out-" + [guid]::NewGuid().ToString() + ".txt")
     $stderrFile = Join-Path $env:TEMP ("oi-err-" + [guid]::NewGuid().ToString() + ".txt")
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($inputFile, $Prompt, $utf8NoBom)
 
-    try {
-        $escapedInputFile = $inputFile.Replace('"', '""')
-        $escapedInterpreter = $InterpreterCommand.Replace('"', '""')
-        $escapedModel = ("ollama/$OllamaModel").Replace('"', '""')
-        $functionFlag = ''
-        if ($DisableLlmFunctions) {
-            $functionFlag = ' --no-llm_supports_functions'
-        }
-        $cmdArgs = "/c type `"$escapedInputFile`" | `"$escapedInterpreter`" -y -s --plain$functionFlag --model `"$escapedModel`""
+    $runnerScript = @"
+param(
+    [Parameter(Mandatory=`$true)]
+    [string]`$InputFile,
 
-        $proc = Start-Process -FilePath 'cmd.exe' `
-            -ArgumentList $cmdArgs `
+    [Parameter(Mandatory=`$true)]
+    [string]`$InterpreterCommand,
+
+    [Parameter(Mandatory=`$true)]
+    [string]`$Model,
+
+    [Parameter(Mandatory=`$true)]
+    [string]`$DisableLlmFunctions
+)
+
+`$disableFunctions = `$false
+if (`$DisableLlmFunctions -match '^(?i:true|1|yes)$') {
+    `$disableFunctions = `$true
+}
+
+`$arguments = @(
+    '-y',
+    '-s',
+    '--plain',
+    '--loop',
+    '-ci',
+    'Execute the first user request immediately. Never ask for a first goal. Never output readiness messages. Perform the task and finish.'
+)
+if (`$disableFunctions) {
+    `$arguments += '--no-llm_supports_functions'
+}
+`$arguments += @('--model', "ollama/`$Model")
+
+`$promptText = Get-Content -Path `$InputFile -Raw -Encoding UTF8
+`$promptText | & `$InterpreterCommand @arguments
+exit `$LASTEXITCODE
+"@
+
+    [System.IO.File]::WriteAllText($runnerFile, $runnerScript, $utf8NoBom)
+
+    try {
+        $proc = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @(
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-File', $runnerFile,
+                '-InputFile', $inputFile,
+                '-InterpreterCommand', $InterpreterCommand,
+                '-Model', $OllamaModel,
+                '-DisableLlmFunctions', ([string][bool]$DisableLlmFunctions)
+            ) `
             -NoNewWindow `
             -PassThru `
             -RedirectStandardOutput $stdoutFile `
@@ -213,6 +253,7 @@ function Invoke-OpenInterpreter {
         }
     } finally {
         Remove-Item $inputFile  -ErrorAction SilentlyContinue
+        Remove-Item $runnerFile -ErrorAction SilentlyContinue
         Remove-Item $stdoutFile -ErrorAction SilentlyContinue
         Remove-Item $stderrFile -ErrorAction SilentlyContinue
     }
@@ -311,6 +352,8 @@ foreach ($designFile in $designFiles) {
 
     $oiPrompt = @"
 Execute immediately. Do not ask for more instructions.
+Never output phrases like "I am ready" or "Please provide your first task".
+If you cannot complete, explicitly say FAILED with one short reason.
 
 Working directory: C:/Programing/GitHubCopilotCLI
 
