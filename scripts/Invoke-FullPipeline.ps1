@@ -128,6 +128,28 @@ if (-not (Test-Path $resolvedInput)) {
     exit 1
 }
 
+$resolvedOutputRoot = [System.IO.Path]::GetFullPath($OutputDir)
+New-Item -ItemType Directory -Path $resolvedOutputRoot -Force | Out-Null
+$stdoutLogFile = Join-Path $resolvedOutputRoot 'copilot-stdout.log'
+$sessionStamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value "===== Pipeline Start: $sessionStamp / StartTask=$StartTask EndTask=$EndTask / Model=$Model ====="
+
+# 文字化けを避けるため、ネイティブコマンド入出力のエンコーディングを UTF-8 に統一する
+$utf8NoBomForConsole = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = $utf8NoBomForConsole
+try {
+    [Console]::OutputEncoding = $utf8NoBomForConsole
+} catch {
+    # ホスト環境によっては設定不可のため無視する
+}
+
+$copilotCommand = 'copilot'
+$copilotCmd = Get-Command 'copilot.cmd' -ErrorAction SilentlyContinue
+if ($copilotCmd) {
+    # PowerShell ラッパー経由の stderr 例外化を避けるため cmd シムを優先
+    $copilotCommand = $copilotCmd.Source
+}
+
 # ─── タスク範囲とプロンプトテンプレートのマッピング ─────────
 # タスク実行範囲（StartTask-EndTask）に対応するプロンプトファイルを選択する
 $promptDir = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\prompts'))
@@ -244,6 +266,14 @@ foreach ($designFile in $designFiles) {
     $taskRangeLabel = if ($StartTask -eq $EndTask) { "タスク $StartTask のみ" } else { "タスク $StartTask-$EndTask" }
     Write-Host "  copilot CLI を呼び出しています（モデル: $modelLabel / $taskRangeLabel を処理）..." -ForegroundColor Yellow
 
+    $runStamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value ""
+    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value "----- [$moduleName] $runStamp -----"
+    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value "DesignFile: $($designFile.FullName)"
+    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value "OutputDir : $resolvedOutput"
+    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value "TaskRange : $taskRangeLabel"
+    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value "Model     : $modelLabel"
+
     # プロンプトをプロジェクトルート直下の一時 .md ファイルに書き出す
     $projectRoot   = Split-Path $PSScriptRoot -Parent
     $tmpPromptFile = Join-Path $projectRoot ".prompt_tmp_$moduleName.md"
@@ -258,8 +288,41 @@ foreach ($designFile in $designFiles) {
     try {
         $copilotArgs = @('--allow-all-tools', '--no-ask-user', '-p', $safePrompt)
         if ($Model) { $copilotArgs += @('--model', $Model) }
+        $copilotArgLine = "--allow-all-tools --no-ask-user -p `"$safePrompt`""
+        if ($Model) {
+            $copilotArgLine += " --model `"$Model`""
+        }
 
-        & copilot @copilotArgs
+        $tmpStdoutFile = Join-Path $env:TEMP ("copilot-out-" + [guid]::NewGuid().ToString() + ".log")
+        $tmpStderrFile = Join-Path $env:TEMP ("copilot-err-" + [guid]::NewGuid().ToString() + ".log")
+        try {
+            $proc = Start-Process -FilePath $copilotCommand `
+                -ArgumentList $copilotArgLine `
+                -NoNewWindow `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $tmpStdoutFile `
+                -RedirectStandardError $tmpStderrFile
+
+            if (Test-Path $tmpStdoutFile) {
+                Get-Content -Path $tmpStdoutFile -Encoding UTF8 | ForEach-Object {
+                    Write-Host $_
+                    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value $_
+                }
+            }
+
+            if (Test-Path $tmpStderrFile) {
+                Get-Content -Path $tmpStderrFile -Encoding UTF8 | ForEach-Object {
+                    Write-Host $_
+                    Add-Content -Path $stdoutLogFile -Encoding UTF8 -Value $_
+                }
+            }
+
+            $global:LASTEXITCODE = [int]$proc.ExitCode
+        } finally {
+            Remove-Item $tmpStdoutFile -Force -ErrorAction SilentlyContinue
+            Remove-Item $tmpStderrFile -Force -ErrorAction SilentlyContinue
+        }
     } finally {
         Remove-Item $tmpPromptFile -Force -ErrorAction SilentlyContinue
     }
@@ -282,3 +345,4 @@ foreach ($designFile in $designFiles) {
 }
 
 Write-Host "`n全処理完了。出力先: $([System.IO.Path]::GetFullPath($OutputDir))" -ForegroundColor Green
+Write-Host "実行ログ: $stdoutLogFile" -ForegroundColor Green
