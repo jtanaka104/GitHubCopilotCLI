@@ -177,7 +177,6 @@ if (`$DisableLlmFunctions -match '^(?i:true|1|yes)$') {
     '-y',
     '-s',
     '--plain',
-    '--loop',
     '-ci',
     'Execute the first user request immediately. Never ask for a first goal. Never output readiness messages. Perform the task and finish.'
 )
@@ -310,6 +309,7 @@ Write-Host "Runtime: Open Interpreter(-y) -> Ollama -> $OllamaModel" -Foreground
 foreach ($designFile in $designFiles) {
     $moduleName      = $designFile.BaseName
     $resolvedOutput  = [System.IO.Path]::GetFullPath((Join-Path $OutputDir $moduleName))
+    $designContent   = Get-Content $designFile.FullName -Raw -Encoding UTF8
 
     New-Item -ItemType Directory -Path (Join-Path $resolvedOutput 'src')        -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $resolvedOutput 'test-items') -Force | Out-Null
@@ -350,14 +350,20 @@ foreach ($designFile in $designFiles) {
     }
     $taskListText = ($taskLines -join "`n")
 
+    $doneToken = '__TASK_DONE__'
+    $failToken = '__TASK_FAILED__'
+
     $oiPrompt = @"
 Execute immediately. Do not ask for more instructions.
 Never output phrases like "I am ready" or "Please provide your first task".
-If you cannot complete, explicitly say FAILED with one short reason.
+If you cannot complete, print $failToken with one short reason.
+You are in NON-INTERACTIVE BATCH mode.
 
 Working directory: C:/Programing/GitHubCopilotCLI
 
-Read these files only:
+Module name: $moduleName
+
+Read these files first:
 - $designPathForPrompt
 - C:/Programing/GitHubCopilotCLI/.github/copilot-instructions.md
 - C:/Programing/GitHubCopilotCLI/.github/instructions/create-source.instructions.md
@@ -373,7 +379,7 @@ Rules:
 - Write files immediately.
 - Keep output short.
 
-At the end, print only created/updated file paths.
+At the end, print only created/updated file paths, then print $doneToken on the last line.
 "@
 
     Write-Host "`n[$moduleName] Running Open Interpreter..." -ForegroundColor Cyan
@@ -386,6 +392,8 @@ At the end, print only created/updated file paths.
     $oiResult = Invoke-OpenInterpreter -InterpreterCommand $InterpreterCommand -OllamaModel $OllamaModel -TimeoutSeconds $InterpreterTimeoutSeconds -DisableLlmFunctions ([bool]$DisableLlmFunctions) -Prompt $oiPrompt
 
     $oiOutputText = ($oiResult.Output -join "`n")
+    $doneDetected = $oiOutputText -match [regex]::Escape($doneToken)
+    $failedDetected = $oiOutputText -match [regex]::Escape($failToken)
     if ($PrintLlmIo) {
         Write-Host "----- OI OUTPUT BEGIN [$moduleName] -----" -ForegroundColor DarkYellow
         if ([string]::IsNullOrWhiteSpace($oiOutputText)) {
@@ -398,8 +406,55 @@ At the end, print only created/updated file paths.
 
     $readyLikeResponse = $oiOutputText -match '(?is)i am ready|please provide your first task|please provide your instructions|provide your first goal'
     if ($readyLikeResponse) {
-        Write-Warning "[$moduleName] Open Interpreter returned a ready message without executing tasks."
+        Write-Warning "[$moduleName] Open Interpreter returned a ready message. Retrying with stricter prompt..."
+
+        $retryPrompt = @"
+INVALID PREVIOUS RESPONSE: you asked for instructions.
+Execute now. Do not ask questions.
+Create/update these files immediately:
+$taskListText
+
+Design content:
+$designPathForPrompt
+
+Return only created/updated file paths, then print $doneToken.
+"@
+
+        if ($PrintLlmIo) {
+            Write-Host "----- OI RETRY PROMPT BEGIN [$moduleName] -----" -ForegroundColor DarkCyan
+            Write-Host $retryPrompt
+            Write-Host "----- OI RETRY PROMPT END [$moduleName] -----" -ForegroundColor DarkCyan
+        }
+
+        $oiResult = Invoke-OpenInterpreter -InterpreterCommand $InterpreterCommand -OllamaModel $OllamaModel -TimeoutSeconds $InterpreterTimeoutSeconds -DisableLlmFunctions ([bool]$DisableLlmFunctions) -Prompt $retryPrompt
+        $oiOutputText = ($oiResult.Output -join "`n")
+        $doneDetected = $oiOutputText -match [regex]::Escape($doneToken)
+        $failedDetected = $oiOutputText -match [regex]::Escape($failToken)
+
+        if ($PrintLlmIo) {
+            Write-Host "----- OI RETRY OUTPUT BEGIN [$moduleName] -----" -ForegroundColor DarkYellow
+            if ([string]::IsNullOrWhiteSpace($oiOutputText)) {
+                Write-Host "<empty>"
+            } else {
+                Write-Host $oiOutputText
+            }
+            Write-Host "----- OI RETRY OUTPUT END [$moduleName] -----" -ForegroundColor DarkYellow
+        }
+
+        $readyAfterRetry = $oiOutputText -match '(?is)i am ready|please provide your first task|please provide your instructions|provide your first goal'
+        if ($readyAfterRetry) {
+            Write-Warning "[$moduleName] Open Interpreter returned a ready message without executing tasks."
+            continue
+        }
+    }
+
+    if ($failedDetected) {
+        Write-Warning "[$moduleName] Open Interpreter reported failure: $failToken"
         continue
+    }
+
+    if (-not $doneDetected) {
+        Write-Warning "[$moduleName] Open Interpreter did not emit completion token: $doneToken"
     }
 
     if ($oiResult.ExitCode -ne 0) {
